@@ -4,6 +4,5 @@ Why spend 5 minutes rewriting a cover letter for jobs when I can spend days work
 
 As a fun puzzle, guess what ihcl stands for!
 
-In all seriousness, this is a project both for my personal utility and demonstration of some basic understanding of utilizing agentic workflows. This is nothing too crazy but I thought it would be fun project as I personally do not enjoy writing cover letters too much. 
-
+In all seriousness, this is a project both for my personal utility and a demonstration of how to leverage agentic workflows. 
 
