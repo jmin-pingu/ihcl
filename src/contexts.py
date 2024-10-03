@@ -1,7 +1,9 @@
 import re
 import docx 
 from pypdf import PdfReader
-import html2text
+from urllib.request import urlopen
+from langchain_community.document_transformers import Html2TextTransformer
+from langchain_community.document_loaders import AsyncHtmlLoader
 
 class Contexts:
     def __init__(self, contextf, delim = ","):
@@ -25,10 +27,13 @@ class ContextParser:
     def parse(self, fname):
         return self.parser(fname)
 
-    def html_parser(self, fname):
-        h = html2text.HTML2Text()
-        h.ignore_links = True
-        return h.handle(fname) 
+    def https_parser(self, fname):
+        urls = [fname]
+        loader = AsyncHtmlLoader(urls)
+        docs = loader.load()
+        html2text = Html2TextTransformer()
+        docs_transformed = html2text.transform_documents(docs)
+        return docs_transformed[0].page_content
 
     def docx_parser(self, fname):
         doc = docx.Document(fname)
@@ -45,7 +50,7 @@ class ContextParser:
 class Context:
     # We can brainstorm this as necessary
     def __str__(self):
-        return "Context(description: {}, path: {}, ftype: {})".format(self.description, self.path, self.ftype)
+        return "Context(description: {}, path: {}, ftype: {}, text: {})".format(self.description, self.path, self.ftype, self.text)
 
     def __init__(self, description, path):
         supported_ftypes = ["txt", "pdf", "docx"]
