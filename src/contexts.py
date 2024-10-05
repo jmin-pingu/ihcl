@@ -4,16 +4,31 @@ from pypdf import PdfReader
 from urllib.request import urlopen
 from langchain_community.document_transformers import Html2TextTransformer
 from langchain_community.document_loaders import AsyncHtmlLoader
+import concurrent
 
+# Is this class really necessary?
 class Contexts:
     def __init__(self, contextf, delim = ","):
         with open(contextf, "r") as f:
             parsed_lines = [[item.strip().replace("\n", "") for item in list(line.split(delim))] for line in f.readlines()]
-            print(parsed_lines)
         if len(parsed_lines) == 0 or len(parsed_lines[0]) != 2:
             raise ValueError("Format of contextf incorrect. Structure should be DESCRIPTION DELIM PATH")
+        # TODO: eventually multi-thread parsing
+        self.contexts = []
+        def init_context(dp_tup):
+            print(f"Processing Context: {dp_tup[0]}, {dp_tup[1]}")
+            return Context(dp_tup[0], dp_tup[1])
 
-        self.contexts = [Context(desc, path) for (desc, path) in parsed_lines]
+        with concurrent.futures.ThreadPoolExecutor(max_workers = 5) as executor:
+            for context in executor.map(init_context, parsed_lines):
+                self.contexts.append(context)
+
+    
+    def __str__(self):
+        return str([str(context) for context in self.contexts])
+
+    def to_dict(self):
+        return {contexts: [context.to_dict() for context in self.contexts]}
         
 # NOTE: maybe I want to extend this design to allow any generic type of parser
 class ContextParser:
@@ -50,7 +65,7 @@ class ContextParser:
 class Context:
     # We can brainstorm this as necessary
     def __str__(self):
-        return "Context(description: {}, path: {}, ftype: {}, text: {})".format(self.description, self.path, self.ftype, self.text)
+        return "Context(description: {}, path: {}, ftype: {}, content: {})".format(self.description, self.path, self.ftype, self.content)
 
     def __init__(self, description, path):
         supported_ftypes = ["txt", "pdf", "docx"]
@@ -70,7 +85,12 @@ class Context:
                 self.ftype = None
         else:
             self.ftype = None
-        self.text = ContextParser(self.ftype).parse(self.path)
 
-    def get_type():
-        pass
+        self.content = ContextParser(self.ftype).parse(self.path)
+
+    def to_dict(self):
+        return {
+            "description": self.description,
+            "content": self.content
+        }
+
