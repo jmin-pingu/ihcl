@@ -9,8 +9,7 @@ from pydantic import BaseModel, Field
 
 # Data Model
 class ContextMetadata(BaseModel):
-    cleaned: bool = Field(description="Whether the Context was cleaned or not")
-    summarized: bool = Field(description="Whether the Context was summarized or not")
+    processed: bool = Field(description="Whether the Context was completely processed or not")
 
 class Context(BaseModel):
     description: str = Field(description="The description about what is contained in this Context object")
@@ -22,24 +21,25 @@ class PreprocessAgentState(BaseModel):
     contexts: List[Context] = Field(description= "A list of Context objects")# descriptions: guidelines for acting on content
 
 # Preprocess Graph
+# NOTE: potentially cache instantiations of this class
 class Preprocess:
     def __init__(self, model, system=""):
         graph = StateGraph(PreprocessAgentState)
 
         graph.add_node("cleaner", self.cleaner)
-        graph.add_node("categorizer", self.categorizer)
-        graph.add_node("summarizer", self.summarizer)
+        # graph.add_node("categorizer", self.categorizer)
+        # graph.add_node("summarizer", self.summarizer)
 
         graph.set_entry_point("cleaner")
-        graph.add_edge("cleaner", "categorizer")
-        graph.add_edge("categorizer", "summarizer")
+        # graph.add_edge("cleaner", "categorizer")
+        # graph.add_edge("categorizer", "summarizer")
 
         # graph.add_conditional_edges(
         #     "categorizer", 
         #     valid_categories, 
         #     {"categorizer": "categorizer", "summarizer": "summarizer"}
         # )
-        graph.add_edge("summarizer", END)
+        graph.add_edge("cleaner", END)
 
         self.graph = graph.compile()
 
@@ -79,7 +79,7 @@ class Preprocess:
         print('Done with [bold yellow]summarizer[/bold yellow]')
 
         for context in summarized_contexts:
-            context.metadata.summarized = True
+            context.metadata.processed = True
 
         return {
             # TODO: think about a better use for messages. What do I want to log?
@@ -113,7 +113,7 @@ class Preprocess:
         print('Done with [bold red]cleaner[/bold red]')
 
         for context in cleaned_contexts:
-            context.metadata.cleaned = True
+            context.metadata.processed = False
 
         return {
             'messages': [AIMessage(content = f"Cleaned contexts: {cleaned_contexts}")],
@@ -149,4 +149,12 @@ class Preprocess:
             'messages': [AIMessage(content = f"New description categories: {response.descriptions}")],
         }
 
+    def invoke(self, contexts: List[Context]):
+        content = "Clean and categorize the list of context objects."
+        messages = [HumanMessage(content=content)]
+        state: PreprocessAgentState = {
+            "messages": messages,
+            "contexts": contexts
+        }
+        return self.graph.invoke(state)
 
