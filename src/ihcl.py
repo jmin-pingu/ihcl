@@ -2,6 +2,7 @@ from rich import print
 import typer
 from typing_extensions import Annotated
 from typing import Optional, Tuple, List
+from langchain_core.messages import AnyMessage, SystemMessage, HumanMessage, ToolMessage
 
 import os
 import sys
@@ -12,11 +13,11 @@ project_root = os.path.dirname(os.path.abspath(__file__))
 src_dir = os.path.join(project_root, 'src')
 sys.path.append(src_dir)
 from contexts import Contexts, Context
-from cleaner import ContextAgentState, Contextifier
+from preprocess import PreprocessAgentState, Preprocess
+from contextify import ContextifierAgentState, Contextifier
 from langchain_openai import ChatOpenAI
 
 # TODO: eventually switch to an ollama model 
-model = ChatOpenAI(model="gpt-4")
 
 app = typer.Typer()
 
@@ -33,10 +34,30 @@ def contextify(
     ):
 
     parsed_contexts = Contexts(contextf, delim)
-    for context in parsed_contexts.contexts:
-        print(context)
     parsed_template = Context("template", templatef)
-    print(parsed_template)
+
+    template_metadata = {
+        "to_substitute": [],
+        "brackets": bracket
+    }
+
+    template = {
+        "content": parsed_template.content,
+        "description": parsed_template.description,
+        "metadata": template_metadata
+    }
+
+    model = ChatOpenAI(model="gpt-4-turbo")
+    contexts = [context.to_dict() | {"metadata": {"processed": False}} for context in parsed_contexts.contexts]    
+    state: ContextifierAgentState = {
+        "messages": [HumanMessage(content = "Fill out the provided template with informtion from the contexts")],
+        "contexts": contexts,
+        "template": template,
+    }
+    result = Contextifier(model).graph.invoke(state)
+    output = result["messages"][-1].content
+    with open("output.txt", "w") as f:
+        f.write(output)
 
     
 if __name__ == "__main__":
