@@ -1,9 +1,10 @@
-from typing import Annotated, Literal, TypedDict, List, Union
+from typing import Annotated, Literal, TypedDict, List, Union, Optional
 from rich import print
 from langgraph.graph import StateGraph, END
 from langchain_core.messages import AnyMessage, SystemMessage, HumanMessage, ToolMessage, AIMessage
 import operator
 import concurrent.futures
+from omegaconf import OmegaConf
 
 from pydantic import BaseModel, Field
 
@@ -13,7 +14,7 @@ class ContextMetadata(BaseModel):
 
 class Context(BaseModel):
     description: str = Field(description="The description about what is contained in this Context object")
-    content: str = Field(description="The content of the context object")
+    content: Optional[str] = Field(description="The content of the context object")
     metadata: ContextMetadata = Field(description="Metadata about the context object")
 
 class PreprocessAgentState(BaseModel):
@@ -23,28 +24,30 @@ class PreprocessAgentState(BaseModel):
 # Preprocess Graph
 # NOTE: potentially cache instantiations of this class
 class Preprocess:
-    def __init__(self, model, system=""):
+    def __init__(self, model, system=None, logf=None):
         graph = StateGraph(PreprocessAgentState)
 
         graph.add_node("cleaner", self.cleaner)
-        # graph.add_node("categorizer", self.categorizer)
-        # graph.add_node("summarizer", self.summarizer)
+        graph.add_node("categorizer", self.categorizer)
+        graph.add_node("summarizer", self.summarizer)
 
         graph.set_entry_point("cleaner")
-        # graph.add_edge("cleaner", "categorizer")
-        # graph.add_edge("categorizer", "summarizer")
+        graph.add_edge("cleaner", "categorizer")
+        graph.add_edge("categorizer", "summarizer")
 
         # graph.add_conditional_edges(
         #     "categorizer", 
         #     valid_categories, 
         #     {"categorizer": "categorizer", "summarizer": "summarizer"}
         # )
-        graph.add_edge("cleaner", END)
+        graph.add_edge("summarizer", END)
 
         self.graph = graph.compile()
+        self.__prompts = OmegaConf.load('src/prompts.yaml')['preprocessor']
 
         # self.tools = {t.name: t for t in tools}
         self.model = model
+        self.logf = logf
 
     def valid_categories(self):
         pass
@@ -52,12 +55,7 @@ class Preprocess:
     def summarizer(self, state: PreprocessAgentState, max_workers = 5):
         # Eventually multithread this to operate per CleanedContext
         print('Invoking [bold yellow]summarizer[/bold yellow]')
-        messages = state.messages
-        SUMMARIZER_PROMPT = """You are a summarizer tasked with intelligently combining the provided list of CleanedContext objects with the SAME description. \
-        Your role is to intelligently combine information from the `content` while being aligned with the intention of the description. \
-        You are allowed to make syntactic or grammatical changes to maintain the flow of content. \
-        Make sure to return the whole `Context` object, only summarizing the `content` based on `description` and `summarized` attribute of `metadata`.
-        """
+        SUMMARIZER_PROMPT = self.__prompts["components"]["summarizer"]["system_prompt"]
 
         grouped_cc = dict()
         for context in state.contexts:
@@ -65,10 +63,7 @@ class Preprocess:
             grouped_cc[context.description].append(context)
         
         def summarize_contexts(contexts):
-            message = HumanMessage(
-                content=f"{contexts}"
-            )
-            messages = [SystemMessage(content=SUMMARIZER_PROMPT)] + [message]
+            messages = [SystemMessage(content=SUMMARIZER_PROMPT)] + [HumanMessage(content=f"{contexts}")]
             return self.model.with_structured_output(Context).invoke(messages)
 
         summarized_contexts = []
@@ -77,32 +72,22 @@ class Preprocess:
                 summarized_contexts.append(cc)
 
         print('Done with [bold yellow]summarizer[/bold yellow]')
-
         for context in summarized_contexts:
             context.metadata.processed = True
 
+        self.append_to_log(f'summarizer: summarized content in Contexts.\n{summarized_contexts}"')
+
         return {
-            # TODO: think about a better use for messages. What do I want to log?
-            'messages': [AIMessage(content = f"Summarized contexts: {summarized_contexts}")],
             'contexts': summarized_contexts
         }
-        pass
 
     def cleaner(self, state: PreprocessAgentState, max_workers = 5):
         # Eventually multithread this to operate per CleanedContext
         print('Invoking [bold red]cleaner[/bold red]')
-        messages = state.messages
-        CLEANER_PROMPT = """You are a text extractor and data cleaner tasked with cleaning the provided Context object.\
-        Your role is to clean/remove information from the `content` that is not related to the `description`.\
-        Only making syntactic or grammatical changes to maintain the flow of content. \
-        Make sure to return the whole `Context` object, only updating the `content` based on `description` and `cleaned` attribute of `metadata`.
-        """
+        CLEANER_PROMPT = self.__prompts["components"]["cleaner"]["system_prompt"]
 
         def clean_context(context):
-            message = HumanMessage(
-                content=f"{context}"
-            )
-            messages = [SystemMessage(content=CLEANER_PROMPT)] + [message]
+            messages = [SystemMessage(content=CLEANER_PROMPT)] + [HumanMessage(content=f"{context}")]
             return self.model.with_structured_output(Context).invoke(messages)
 
         cleaned_contexts = []
@@ -110,51 +95,51 @@ class Preprocess:
             for cc in executor.map(clean_context, state.contexts):
                 cleaned_contexts.append(cc)
 
+
+        cleaned_contexts = list(filter(lambda c: c.content != None, cleaned_contexts))
         print('Done with [bold red]cleaner[/bold red]')
 
         for context in cleaned_contexts:
             context.metadata.processed = False
 
+        self.append_to_log(f'cleaner: cleaned content in Contexts unrelated to description.\n{cleaned_contexts}"')
         return {
-            'messages': [AIMessage(content = f"Cleaned contexts: {cleaned_contexts}")],
             'contexts': cleaned_contexts
         }
 
     def categorizer(self, state: PreprocessAgentState, categories = None):
         print('Invoking [bold blue]categorizer[/bold blue]')
-
-        messages = state.messages
         # You will potentially rename the descriptions in the provided list of CleanedContext object which contains a `Context` object with an associated `cleaned` boolean indicator. \
 
-        CATEGORIZER_PROMPT = """You are a categorizer, finding similarities between provided descriptions and giving them a common category if it makes sense. \
-        Your job is to find commonalities between the `description`s and rename them into categories so that we can combine their information in the future. \
-        You will be operating over a list of descriptions and you can only modify them in-place. \
-        If there is no need to rename the `description`s, then keep the existing descriptions.
-        """
+        CATEGORIZER_PROMPT = self.__prompts["components"]["categorizer"]["system_prompt"]
 
         class Descriptions(BaseModel):
             descriptions: List[str] = Field(description= "A list of descriptions", min_length=len(state.contexts), max_length=len(state.contexts))
 
         descriptions = [context.description for context in state.contexts]
-        message = HumanMessage(content=f"{descriptions}")
-        messages = [SystemMessage(content=CATEGORIZER_PROMPT)] + [message]
+        messages = [SystemMessage(content=CATEGORIZER_PROMPT)] + [HumanMessage(content=f"{descriptions}")]
         response = self.model.with_structured_output(Descriptions).invoke(messages)
 
         for context, new_desc in zip(state.contexts, response.descriptions):
             context.description = new_desc
             
         print('Done with [bold blue]categorizer[/bold blue]')
-        print(f'Output: {response.descriptions}')
+        self.append_to_log(f'categorizer: identified categories for Contexts\n{response}"')
         return {
-            'messages': [AIMessage(content = f"New description categories: {response.descriptions}")],
+            'contexts': state.contexts
         }
 
     def invoke(self, contexts: List[Context]):
-        content = "Clean and categorize the list of context objects."
+        content = "Preprocess the list of context objects."
         messages = [HumanMessage(content=content)]
         state: PreprocessAgentState = {
-            "messages": messages,
             "contexts": contexts
         }
+        self.append_to_log(f'system: {content}"')
         return self.graph.invoke(state)
 
+    def append_to_log(self, text):
+        if self.logf == None:
+            return  
+        with open(self.logf, "a") as f:
+            f.write(text + "\n") 

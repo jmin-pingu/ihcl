@@ -4,6 +4,7 @@ from langgraph.graph import StateGraph, END
 from langchain_core.messages import AnyMessage, SystemMessage, HumanMessage, ToolMessage, AIMessage
 import operator
 import concurrent.futures
+from omegaconf import OmegaConf
 
 from pydantic import BaseModel, Field
 
@@ -30,13 +31,22 @@ class Template(BaseModel):
     description: str = Field(description = "A description about the template")
     metadata: TemplateMetadata = Field(description= "Metadata associated with the template")
 
+class FilledTemplates(BaseModel):
+    filled_templates: List[str] = Field(description= "A list of templates filled with information from the Contexts object")
+
 class ContextifierAgentState(BaseModel):
-    messages: Annotated[List[Union[HumanMessage,SystemMessage,AIMessage]], operator.add] = Field(description= "The history of messages")# messages: keeps track of history
     contexts: List[Context] = Field(description= "A list of Context objects")# descriptions: guidelines for acting on content
     template: Template = Field(description = "The template that we want to fill out with information in contexts")
+    output: Optional[FilledTemplates] = Field(description = "The final output to the contextifier agent")
 
 class Contextifier:
-    def __init__(self, model, system=""):
+    def __init__(self, model, system=None, logf=None):
+        self.__prompts = OmegaConf.load('src/prompts.yaml')['contextifier']
+
+        if system != None:
+            self.system = [SystemMessage(content = system)]
+        else:
+            self.system = [SystemMessage(content = self.__prompts['main_system_prompt'])]
         graph = StateGraph(ContextifierAgentState)
 
         graph.add_node("preprocessor", self.preprocessor)
@@ -62,15 +72,19 @@ class Contextifier:
         #     valid_categories, 
         #     {END: END, "...": "..."}
         # )
+
         self.graph = graph.compile()
         self.model = model
+        self.logf = logf
+        if self.logf != None:
+             with open(self.logf, "w") as f:
+                 pass
 
-        self.__preprocess = Preprocess(model)
+        self.__preprocess = Preprocess(model, logf=self.logf)
 
     def preprocessor(self, state: ContextifierAgentState):
         to_process_contexts = []
         processed_contexts = []
-        messages = []
 
         print('Invoking [bold green]preprocessor[/bold green]')
 
@@ -83,10 +97,9 @@ class Contextifier:
         if len(to_process_contexts) > 0:
             result = self.__preprocess.invoke(to_process_contexts)
             to_process_contexts = result["contexts"]
-            messages = result["messages"]
 
+        self.append_to_log(f'preprocessor: preprocessed contexts.\n{processed_contexts + to_process_contexts}')
         return {
-            "messages": messages + [AIMessage(content = "Preprocessed contexts.")],
             "contexts": processed_contexts + to_process_contexts
         }
 
@@ -95,86 +108,59 @@ class Contextifier:
             to_replace: List[str] = Field(description = "Text inside the template contained within the brackets, {brackets}".format(brackets = state.template.metadata.brackets))
 
         print('Invoking [bold purple]extractor[/bold purple]')
-        EXTRACTOR_PROMPT = """You are an extractor whose role is to identify and extract text contained inside the specified brackets. 
-        Here is an example
-        INPUTS:
-        Bracket: (<, >)
-        Template: I am really craving some <insert a food>
+        EXTRACTOR_PROMPT = self.__prompts["components"]["extractor"]["system_prompt"]
 
-        OUTPUT:
-        [insert a food]
-        """
-        message = HumanMessage(content=f"Here is a template, a description about the information in the template, and the brackets to help identify text/content: \nDESCRIPTION: {state.template.description}\nTEMPLATE: {state.template.content}\nBRACKETS: {state.template.metadata.brackets}")
-        messages = [SystemMessage(content=EXTRACTOR_PROMPT)] + [message]
+        message = HumanMessage(content=self.__prompts["components"]["extractor"]["human_prompt"].format(description=state.template.description, template=state.template.content, brackets=state.template.metadata.brackets))
+        messages = self.system + [SystemMessage(content=EXTRACTOR_PROMPT)] + [message]
         response = self.model.with_structured_output(ToReplace).invoke(messages)
             
         print('Done with [bold purple]extractor[/bold purple]')
-        print(f'Output: {response.to_replace}')
+
+        self.append_to_log(f'extractor: identified and extracted text to replace in template.\n{response.to_replace}"')
         return response.to_replace
         
     # TODO: Improve the tagger
     def tagger(self, state: ContextifierAgentState):
-        messages = state.messages
         extracted_template = self.extractor(state)
 
         class ToSubstitute(BaseModel):
             to_substitute: List[RelatedInformation] = Field(description= "The related information for each of the sections/areas that will be filled/replaced with information from contexts") 
         
         # TODO: improve system prompt
-        TAGGER_PROMPT = """You are a data collector who will find content to replace each of words to replace. 
-        Thus, your job is to find pieces of information that best correspond to the text/information from the template that we want to substitute, using the `content` from the Contexts. 
+        TAGGER_PROMPT = self.__prompts["components"]["tagger"]["system_prompt"]
 
-        Make sure to include ALL the information that can be used to replace the text that we want to substitute. We want to make sure that there are multiple options (if they exist, of course).
-        """
-        message = HumanMessage(content=f"\nCONTEXTS: {state.contexts}\nTEXT TO SUBSTITUTE: {extracted_template}")
-        messages = [SystemMessage(content=TAGGER_PROMPT)] + [message]
+
+        message = HumanMessage(content=self.__prompts["components"]["tagger"]["human_prompt"].format(contexts = state.contexts, text_to_substitute=extracted_template))
+        messages = self.system + [SystemMessage(content=TAGGER_PROMPT)] + [message]
         response = self.model.with_structured_output(ToSubstitute).invoke(messages)
 
         # TODO: update the state
         state.template.metadata.to_substitute = response.to_substitute
+
+        # Log changes
+        self.append_to_log(f'tagger: tagged each string to replace in the template with related information from Contexts.\n{response}"')
         return {
-            "messages": [AIMessage(content= "Labeled descriptions")],
             "template": state.template
         }
+
+    def append_to_log(self, text):
+        if self.logf == None:
+            return  
+        with open(self.logf, "a") as f:
+            f.write(text + "\n") 
 
     def contextifier(self, state: ContextifierAgentState, noutputs = 3):
         print('Invoking [bold dark_orange]contextifier[/bold dark_orange]')
-        CONTEXTIFIER_PROMPT = """You are writer whose role is seamlessly blend and substitute information that we've extracted into the template. Prioritize the information that we have gathered like `to_substitute`. Feel free to make slight modifications around the areas which will be substituted to make sure that everything flows grammatically and syntactically. 
-        """
-        message = HumanMessage(content=f"Fill in the tagged areas in the template (which are identified by brackets) to complete the template, utilizing the contexts and template metadata to aid in this task. \nTEMPLATE: {state.template.content}\nBRACKETS: {state.template.metadata.brackets}\nContexts: {state.contexts}\n\nGive me {noutputs} versions of the filled template")
+        CONTEXTIFIER_PROMPT = self.__prompts["components"]["contextifier"]["system_prompt"]
+
+        message = HumanMessage(content=self.__prompts["components"]["contextifier"]["human_prompt"].format(template = state.template.content, brackets = state.template.metadata.brackets, contexts = state.contexts, noutputs = noutputs))
         messages = [SystemMessage(content=CONTEXTIFIER_PROMPT)] + [message]
-        response = self.model.invoke(messages)
-            
+        response = self.model.with_structured_output(FilledTemplates).invoke(messages)
         print('Done with [bold dark_orange]contextifier[/bold dark_orange]')
-        return {'messages': [response]}
-        
-    # TODO: Improve the tagger
-    def tagger(self, state: ContextifierAgentState):
-        print('Invoking [bold dodger_blue]tagger[/bold dodger_blue]')
-        messages = state.messages
-        extracted_template = self.extractor(state)
 
-        class ToSubstitute(BaseModel):
-            to_substitute: List[RelatedInformation] = Field(description= "The related information for each of the sections/areas that will be filled/replaced with information from contexts") 
-        
-        # TODO: improve system prompt
-        TAGGER_PROMPT = """You are a data collector who will find content to replace each of words to replace. 
-        Thus, your job is to find pieces of information that best correspond to the text/information from the template that we want to substitute, using the `content` from the Contexts. 
-
-        Make sure to include ALL the information that can be used to replace the text that we want to substitute. We want to make sure that there are multiple options (if they exist, of course).
-        """
-        message = HumanMessage(content=f"\nCONTEXTS: {state.contexts}\nTEXT TO SUBSTITUTE: {extracted_template}")
-        messages = [SystemMessage(content=TAGGER_PROMPT)] + [message]
-        response = self.model.with_structured_output(ToSubstitute).invoke(messages)
-        print('Done with [bold dodger_blue]tagger[/bold dodger_blue]')
-
-        # TODO: update the state
-        state.template.metadata.to_substitute = response.to_substitute
-        return {
-            "messages": [AIMessage(content= "Labeled descriptions")],
-            "template": state.template
-        }
-        pass
+        self.append_to_log(f'contextifier: state of template.\n{state.template}"')
+        self.append_to_log(f'contextifier: created {noutputs} filled templates with information in the contexts.\n{response}"')
+        return {'output': response}         
 
     def gatherer(self, state: ContextifierAgentState):
         pass
