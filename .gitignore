@@ -2,3 +2,4 @@ venv
 data
 proto.py
 output
+log
