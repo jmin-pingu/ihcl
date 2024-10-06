@@ -28,7 +28,7 @@ def contextify(
         bracket: Annotated[Tuple[str, str], typer.Argument(help="The pair of brackets which identify fields in the template that will be filled with context")],
         delim: Annotated[str, typer.Option("--delim", "-d", help= "The delimiter for contextf")] = ",",
         hitl: Annotated[bool, typer.Option("--hitl", "-h", help= "Option for human in the loop workflow")] = False,
-        log: Annotated[str, typer.Option("--log", "-l", help= "Filename for log")] = None
+        logf: Annotated[str, typer.Option("--log", "-l", help= "Filename for log")] = None
         # human-in-the-loop option
         # tools
     ):
@@ -47,17 +47,21 @@ def contextify(
         "metadata": template_metadata
     }
 
-    model = ChatOpenAI(model="gpt-4-turbo")
+    model = ChatOpenAI(model="gpt-4o-mini")
     contexts = [context.to_dict() | {"metadata": {"processed": False}} for context in parsed_contexts.contexts]    
     state: ContextifierAgentState = {
-        "messages": [HumanMessage(content = "Fill out the provided template with informtion from the contexts")],
         "contexts": contexts,
         "template": template,
+        "output": None
     }
-    result = Contextifier(model).graph.invoke(state)
-    output = result["messages"][-1].content
-    with open("output.txt", "w") as f:
-        f.write(output)
+
+    result = Contextifier(model, logf=logf).graph.invoke(state)
+    
+
+    response = result["output"].filled_templates
+    for i, txt in enumerate(response):
+        with open("output/filled_template_{}.txt".format(i), "w") as f:
+            f.write(txt)
 
     
 if __name__ == "__main__":

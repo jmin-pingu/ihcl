@@ -5,18 +5,22 @@ from urllib.request import urlopen
 from langchain_community.document_transformers import Html2TextTransformer
 from langchain_community.document_loaders import AsyncHtmlLoader
 import concurrent
+from rich import print
 
 # Is this class really necessary?
 class Contexts:
     def __init__(self, contextf, delim = ","):
         with open(contextf, "r") as f:
             parsed_lines = [[item.strip().replace("\n", "") for item in list(line.split(delim))] for line in f.readlines()]
-        if len(parsed_lines) == 0 or len(parsed_lines[0]) != 2:
+        if len(parsed_lines) == 0:
             raise ValueError("Format of contextf incorrect. Structure should be DESCRIPTION DELIM PATH")
-        # TODO: eventually multi-thread parsing
+        parsed_lines = list(filter(lambda x: len(x) == 2, parsed_lines))
+
         self.contexts = []
+        print(f"[bold bright_red]Processing Contexts[/bold bright_red]")
+
         def init_context(dp_tup):
-            print(f"Processing Context: {dp_tup[0]}, {dp_tup[1]}")
+            print(f"\t-> processing Context: {dp_tup[1]}")
             return Context(dp_tup[0], dp_tup[1])
 
         with concurrent.futures.ThreadPoolExecutor(max_workers = 5) as executor:
@@ -55,7 +59,7 @@ class ContextParser:
         return "\n".join([par.text for par in doc.paragraphs])
 
     def txt_parser(self, fname):
-        with (fname, 'r') as f:
+        with open(fname, 'r') as f:
             return "\n".join(f.readlines())
 
     def pdf_parser(self, fname):
