@@ -6,27 +6,41 @@ from langchain_community.document_transformers import Html2TextTransformer
 from langchain_community.document_loaders import AsyncHtmlLoader
 import concurrent
 from rich import print
+import requests
+import functools
+import html2text
+from typing_extensions import TypedDict, List
+from pydantic import TypeAdapter
 
-# Is this class really necessary?
+import os
+
 class Contexts:
-    def __init__(self, contextf, delim = ","):
-        with open(contextf, "r") as f:
-            parsed_lines = [[item.strip().replace("\n", "") for item in list(line.split(delim))] for line in f.readlines()]
-        if len(parsed_lines) == 0:
-            raise ValueError("Format of contextf incorrect. Structure should be DESCRIPTION DELIM PATH")
-        parsed_lines = list(filter(lambda x: len(x) == 2, parsed_lines))
+    def __init__(self, contexts, delim = ","):
+        class ContextInput(TypedDict): 
+            description: str
+            path: str
+        
+        class ContextsInput(TypedDict):
+            contexts: List[ContextInput]
+
+        try:
+            ta = TypeAdapter(ContextsInput)
+            ta.validate_python({"contexts": contexts})
+        except:
+            raise ValueError("`contexts` is not of the correct structure. Double-check contextf.")
 
         self.contexts = []
         print(f"[bold bright_red]Processing Contexts[/bold bright_red]")
-
-        def init_context(dp_tup):
-            print(f"\t-> processing Context: {dp_tup[1]}")
-            return Context(dp_tup[0], dp_tup[1])
+        
+        # NOTE: we need to cache because we do not want to reparse strings that we already have handled
+        @functools.cache
+        def init_context(context):
+            print(f"\t-> processing Context: {context['path']}")
+            return Context(context['description'], context['path'])
 
         with concurrent.futures.ThreadPoolExecutor(max_workers = 5) as executor:
-            for context in executor.map(init_context, parsed_lines):
+            for context in executor.map(init_context, contexts):
                 self.contexts.append(context)
-
     
     def __str__(self):
         return str([str(context) for context in self.contexts])
@@ -47,13 +61,20 @@ class ContextParser:
         return self.parser(fname)
 
     def https_parser(self, fname):
-        urls = [fname]
-        loader = AsyncHtmlLoader(urls)
-        docs = loader.load()
-        html2text = Html2TextTransformer()
-        docs_transformed = html2text.transform_documents(docs)
-        return docs_transformed[0].page_content
-
+        try: 
+            urls = [fname]
+            loader = AsyncHtmlLoader(urls)
+            docs = loader.load()
+            h2t = Html2TextTransformer()
+            docs_transformed = h2t.transform_documents(docs)
+            content = docs_transformed[0].page_content
+        except Exception as inst:
+            print(f"Error Parsing: {inst}\nRetrying") 
+            with requests.Session() as s:
+                response = s.get(fname)
+            h = html2text.HTML2Text()
+            content = h.handle(str(response.content))
+        return content
     def docx_parser(self, fname):
         doc = docx.Document(fname)
         return "\n".join([par.text for par in doc.paragraphs])
@@ -77,18 +98,18 @@ class Context:
         self.description = description
         self.path = path
 
-        ftype_search = re.search(r'.*?\.([a-z]*)$', path)
+        ftype = os.path.splitext(path)[1]
         http_search = re.match(r'^http(s?):.*', path)
         if http_search != None:
             self.ftype = "https"
-        elif ftype_search != None: 
-            ftype = ftype_search.group(1)
-            if ftype in supported_ftypes:
-                self.ftype = ftype 
+        elif ftype != '': 
+            if ftype[1:] in supported_ftypes:
+                self.ftype = ftype[1:]
             else:
                 self.ftype = None
         else:
             self.ftype = None
+
 
         self.content = ContextParser(self.ftype).parse(self.path)
 
